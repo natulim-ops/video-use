@@ -40,12 +40,23 @@ except Exception:
 
 # -------- Subtitle style (proven at 1920×1080, from HEURISTICS §5) -----------
 
-SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
-    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-    "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=35"
-)
+# ASS subtitle style parameters (matches natulim-ai-ugc-studio spec).
+# We write a full ASS file with PlayResX/Y headers so libass interprets all
+# size/margin values in real pixel coordinates, not the 384x288 default.
+SUB_STYLE = {
+    "fontname": "Proxima Nova Semibold",
+    "fontsize": 75,
+    "bold": -1,
+    "primary": "&H00FFFFFF",   # white
+    "outline_color": "&H00000000",  # black
+    "back_color": "&H80000000",     # semi-transparent black box (if BorderStyle=3)
+    "outline": 3,
+    "shadow": 0,
+    "alignment": 2,             # bottom-center
+    "margin_v": 350,
+    "margin_lr_pct": 0.08,      # 8% of PlayResX
+    "border_style": 1,          # 1=outline only, 3=opaque box
+}
 
 # -------- Helpers ------------------------------------------------------------
 
@@ -107,10 +118,15 @@ def extract_segment(
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Scale so the LONG edge is capped (1920 for final, 1280 for draft).
+    # This handles both portrait and landscape sources: portrait 2160x3840
+    # becomes 1080x1920; landscape 3840x2160 becomes 1920x1080.
+    # Keeps output at social-media-standard HD dimensions, 4x faster to
+    # render than 4K with subtitle overlays.
     if draft:
-        scale = "scale=1280:-2"
+        scale = "scale='if(gt(iw,ih),1280,-2)':'if(gt(iw,ih),-2,1280)'"
     else:
-        scale = "scale=1920:-2"
+        scale = "scale='if(gt(iw,ih),1920,-2)':'if(gt(iw,ih),-2,1920)'"
 
     vf_parts = [scale]
     if grade_filter:
@@ -137,7 +153,7 @@ def extract_segment(
         "-af", af,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
         "-pix_fmt", "yuv420p", "-r", "24",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "1",
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -230,6 +246,34 @@ def _srt_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _ass_timestamp(seconds: float) -> str:
+    """ASS uses h:mm:ss.cc (centiseconds)."""
+    total_cs = int(round(seconds * 100))
+    h, rem = divmod(total_cs, 360_000)
+    m, rem = divmod(rem, 6000)
+    s, cs = divmod(rem, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _probe_dimensions(video_path: Path) -> tuple[int, int]:
+    """Probe video dimensions. Returns (width, height). Defaults to 1080x1920 on error."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                str(video_path),
+            ],
+            text=True,
+        ).strip()
+        w, h = out.split("x")
+        return int(w), int(h)
+    except Exception:
+        return 1080, 1920
+
+
 def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict]:
     out: list[dict] = []
     for w in transcript.get("words", []):
@@ -245,15 +289,25 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
     return out
 
 
-def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
-    """Build an output-timeline SRT from per-source transcripts.
+def build_master_ass(
+    edl: dict,
+    edit_dir: Path,
+    out_path: Path,
+    play_res_x: int = 1080,
+    play_res_y: int = 1920,
+) -> None:
+    """Build an output-timeline ASS file from per-source transcripts.
 
     - 2-word chunks (break on any punctuation in between)
     - UPPERCASE text
     - Output times computed as word.start - segment_start + segment_offset
+    - Writes PlayResX/Y headers so libass interprets sizes in real pixel
+      coordinates (not the 384x288 default — which would push MarginV=350
+      completely off screen on a 1920-tall canvas).
+    - Styling is the natulim-ai-ugc-studio spec: Proxima Nova Semibold 75,
+      white with 3px black outline, bottom-center, MarginV=350 from bottom.
     """
     transcripts_dir = edit_dir / "transcripts"
-    sources = edl["sources"]
 
     entries: list[tuple[float, float, str]] = []
     seg_offset = 0.0
@@ -281,7 +335,6 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             if not text:
                 continue
             current.append(w)
-            # Break if the current text ends in punctuation or we hit 2 words
             ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
             if len(current) >= 2 or ends_in_punct:
                 chunks.append(current)
@@ -298,23 +351,52 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
                 out_end = out_start + 0.4
             text = " ".join((w.get("text") or "").strip() for w in chunk)
             text = re.sub(r"\s+", " ", text).strip()
-            # Strip trailing punctuation for cleaner uppercase look
             text = text.rstrip(",;:")
             text = text.upper()
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
 
-    # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
-    lines: list[str] = []
-    for i, (a, b, t) in enumerate(entries, start=1):
-        lines.append(str(i))
-        lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
-        lines.append(t)
-        lines.append("")
-    out_path.write_text("\n".join(lines))
-    print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+
+    margin_lr = round(play_res_x * SUB_STYLE["margin_lr_pct"])
+    style_line = (
+        f"Style: Default,{SUB_STYLE['fontname']},{SUB_STYLE['fontsize']},"
+        f"{SUB_STYLE['primary']},&H000000FF,{SUB_STYLE['outline_color']},"
+        f"{SUB_STYLE['back_color']},{SUB_STYLE['bold']},0,0,0,"
+        f"100,100,0,0,{SUB_STYLE['border_style']},{SUB_STYLE['outline']},"
+        f"{SUB_STYLE['shadow']},{SUB_STYLE['alignment']},"
+        f"{margin_lr},{margin_lr},{SUB_STYLE['margin_v']},1"
+    )
+
+    header = "\n".join([
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {play_res_x}",
+        f"PlayResY: {play_res_y}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        style_line,
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+        "MarginV, Effect, Text",
+    ])
+
+    dialogue_lines = [
+        f"Dialogue: 0,{_ass_timestamp(a)},{_ass_timestamp(b)},"
+        f"Default,,0,0,0,,{t}"
+        for a, b, t in entries
+    ]
+
+    out_path.write_text(header + "\n" + "\n".join(dialogue_lines) + "\n")
+    print(f"master ASS → {out_path.name} ({len(entries)} cues, PlayRes={play_res_x}x{play_res_y})")
 
 
 # -------- Loudness normalization (social-ready audio) -----------------------
@@ -471,9 +553,15 @@ def build_final_composite(
     # Subtitles LAST — Rule 1
     if has_subs:
         subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
-        filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
-        )
+        # ASS files carry their own PlayRes + style; use the ass filter so
+        # libass does not need to guess sizes from a 384x288 default canvas.
+        if subtitles_path.suffix.lower() == ".ass":
+            filter_parts.append(f"{current}ass='{subs_abs}'[outv]")
+        else:
+            # Fallback for legacy SRT paths: use subtitles filter with force_style
+            filter_parts.append(
+                f"{current}subtitles='{subs_abs}'[outv]"
+            )
         out_label = "[outv]"
     else:
         # Rename the last overlay output to [outv] for consistency
@@ -563,8 +651,15 @@ def main() -> None:
     subs_path: Path | None = None
     if not args.no_subtitles:
         if args.build_subtitles:
-            subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            # Probe base.mp4 to get actual output dimensions; libass needs
+            # PlayResX/Y in ASS headers to position and size correctly.
+            play_res_x, play_res_y = _probe_dimensions(base_path)
+            subs_path = edit_dir / "master.ass"
+            build_master_ass(
+                edl, edit_dir, subs_path,
+                play_res_x=play_res_x,
+                play_res_y=play_res_y,
+            )
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
             if not subs_path.exists():
