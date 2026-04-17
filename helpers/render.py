@@ -352,7 +352,6 @@ def build_master_ass(
             text = " ".join((w.get("text") or "").strip() for w in chunk)
             text = re.sub(r"\s+", " ", text).strip()
             text = text.rstrip(",;:")
-            text = text.upper()
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
